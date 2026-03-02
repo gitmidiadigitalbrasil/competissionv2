@@ -1,4 +1,7 @@
+import warnings
+warnings.filterwarnings("ignore", message=".*non-writable.*")
 import torch
+import torch.nn.functional as F
 import uvicorn
 import argparse
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -8,820 +11,385 @@ import brotli
 import struct
 import numpy as np
 
-
-# =========================
-# BFP CONFIG (tune these)
-# =========================
-BFP_BLOCK_SIZE_DEFAULT = 209  # Default aggressive, fallback to 160 if needed
-BROTLI_QUALITY = 10           # optimal: 11 causes timeout
-
-MAGIC = b"BF14"               # BF14 format (bf16 scales, nibble-split int8)
-
-CANDIDATES = [239, 235, 233, 231, 230, 227, 225, 220]
-
-THRESHOLDS = {
-    239: 0.99990,
-    235: 0.99990,
-    233: 0.99990,
-    231: 0.99990,
-    230: 0.99990,
-    227: 0.99990,
-    225: 0.99992,
-    220: 0.99995,
-}
-
-
-
-def bfp_encode_bf16_bytes(data: bytes, block_size: int) -> bytes:
-    """
-    Encode bf16 bytes -> BFP payload bytes with byte-plane separation for scales
-    and nibble separation for quantized payload.
-
-    Payload format (all little-endian):
-      MAGIC (4) = b"BF14"
-      n_elems (u32)
-      block_size (u16)
-      scales (num_blocks * bf16, byte-plane separated)
-      quantized (n_elems * int8, nibble-separated)
-    """
-    if len(data) % 2 != 0:
-        raise ValueError("Input data length is not a multiple of 2 (bf16 bytes expected).")
-
-    n_elems = len(data) // 2
-    if n_elems == 0:
-        raise ValueError("Empty bf16 matrix.")
-
-    if block_size <= 0:
-        raise ValueError("block_size must be positive.")
-
-    # Read as bf16 then cast to float32 for quantization
-    x_bf16 = torch.frombuffer(bytearray(data), dtype=torch.bfloat16)
-    x = x_bf16.float()
-
-    # Pad to multiple of block_size
-    num_blocks = (n_elems + block_size - 1) // block_size
-    padded_len = num_blocks * block_size
-    if padded_len > n_elems:
-        x = torch.nn.functional.pad(x, (0, padded_len - n_elems), value=0.0)
-
-    # Reshape into blocks
-    x_blocks = x.view(num_blocks, block_size)
-
-    # Compute per-block scales (max absolute value)
-    scales = x_blocks.abs().max(dim=1).values  # shape: (num_blocks,)
-
-    # Use bfloat16 for scales
-    scales_bf16 = scales.to(torch.bfloat16)
-    
-    # CRITICAL: Use the stored scale values for quantization
-    scales_safe = scales_bf16.float().clone()
-    scales_safe[scales_safe == 0] = 1.0
-
-    # Quantize to [-127, 127] range (int8)
-    Q = 127.0
-    x_normalized = x_blocks / scales_safe.unsqueeze(1)  # normalize to [-1, 1]
-    x_quantized = torch.round(x_normalized * Q).clamp(-127, 127).to(torch.int8)
-
-    # Flatten and trim to original length
-    x_quantized_flat = x_quantized.view(-1)[:n_elems]
-
-    # Build header
-    header = bytearray()
-    header += MAGIC
-    header += struct.pack("<I", n_elems)
-    header += struct.pack("<H", block_size)
-
-    # SCALES: Byte-plane separation
-    scales_view = scales_bf16.view(torch.int16).numpy()
-    scales_bytes = scales_view.tobytes()
-    scales_arr = np.frombuffer(scales_bytes, dtype=np.uint8).reshape(-1, 2)
-    scales_reordered = np.concatenate([scales_arr[:, i] for i in range(2)])
-
-    # PAYLOAD: Nibble Splitting
-    # Split int8 into high nibble stream and low nibble stream.
-    # This groups the 'sign/magnitude' (high nibbles) together, which compresses very well.
-    q_np = x_quantized_flat.numpy().view(np.uint8)
-    
-    # Handle odd length by padding temporarily
-    n_q = q_np.size
-    pad_byte = False
-    if n_q % 2 != 0:
-        q_np = np.append(q_np, 0)
-        pad_byte = True
-
-    # Reshape to pairs for packing
-    pairs = q_np.reshape(-1, 2)
-    
-    # Extract nibbles (vectorized)
-    # pair[0] -> h0, l0 | pair[1] -> h1, l1
-    # stream_high = (h0 << 4) | h1
-    # stream_low  = (l0 << 4) | l1
-    
-    h0 = pairs[:, 0] >> 4
-    h1 = pairs[:, 1] >> 4
-    high_packed = (h0 << 4) | h1
-    
-    l0 = pairs[:, 0] & 0x0F
-    l1 = pairs[:, 1] & 0x0F
-    low_packed = (l0 << 4) | l1
-    
-    payload = bytes(header) + scales_reordered.tobytes() + high_packed.tobytes() + low_packed.tobytes()
-    return payload
-
-
-def bfp_decode_to_bf16_bytes(payload: bytes) -> bytes:
-    """
-    Decode BFP payload bytes -> bf16 bytes.
-    Vectorized for speed.
-    """
-    if len(payload) >= 4:
-        magic = payload[:4]
-        if magic == MAGIC:
-            return _decode_bfp14(payload)
-        if magic == b"BF12":
-            return _decode_bfp12(payload)
-        if magic == b"BF11":
-            return _decode_bfp11(payload)
-        if magic == b"BF10":
-            return _decode_bfp10(payload)
-        if magic == b"BFP9":
-            return _decode_bfp9(payload)
-        if magic == b"BFP6":
-            return _decode_bfp6(payload)
-        if magic == b"BFP2":
-            return _decode_bfp2(payload)
-        if magic == b"BFP1":
-            return _decode_bfp1(payload)
-
-    # If not our format, assume raw bf16 bytes
-    if len(payload) % 2 == 0:
-        return payload
-    raise ValueError("Unknown payload format and not valid bf16 bytes.")
-
-
-def _decode_bfp14(payload: bytes) -> bytes:
-    """Decode BF14 format (bf16 byte-split scales + nibble-split int8)."""
-    min_header = 4 + 4 + 2
-    if len(payload) < min_header:
-        raise ValueError("Payload too small to be valid BF14.")
-
-    offset = 4
-    n_elems = struct.unpack_from("<I", payload, offset)[0]
-    offset += 4
-    block_size = struct.unpack_from("<H", payload, offset)[0]
-    offset += 2
-
-    if n_elems == 0:
-        return b""
-
-    num_blocks = (n_elems + block_size - 1) // block_size
-
-    # 1. Read scales (bf16, byte-plane reordered)
-    scales_bytes_len = num_blocks * 2
-    scales_end = offset + scales_bytes_len
-    if scales_end > len(payload):
-        raise ValueError("Payload ended early while reading scales.")
-    
-    scales_reordered = np.frombuffer(payload[offset:scales_end], dtype=np.uint8)
-    scales_arr = np.zeros((num_blocks, 2), dtype=np.uint8)
-    for i in range(2):
-        scales_arr[:, i] = scales_reordered[i*num_blocks:(i+1)*num_blocks]
-    
-    scales_int16 = np.frombuffer(scales_arr.tobytes(), dtype=np.int16)
-    scales_bf16 = torch.from_numpy(scales_int16.copy()).view(torch.bfloat16)
-    scales = scales_bf16.float()
-    offset = scales_end
-
-    # 2. Read Quantized Data (Nibble Split)
-    # We must calculate the size of the packed streams.
-    # n_elems might be odd.
-    n_packed = (n_elems + 1) // 2
-    
-    high_end = offset + n_packed
-    low_end = high_end + n_packed
-    if low_end > len(payload):
-         raise ValueError("Payload ended early while reading quantized data.")
-
-    high_packed = np.frombuffer(payload[offset:high_end], dtype=np.uint8)
-    low_packed = np.frombuffer(payload[high_end:low_end], dtype=np.uint8)
-    
-    # Vectorized Unpack
-    # high_packed[i] => h0, h1
-    h0 = high_packed >> 4
-    h1 = high_packed & 0x0F
-    
-    l0 = low_packed >> 4
-    l1 = low_packed & 0x0F
-    
-    # Reconstruct bytes
-    # byte0 = (h0 << 4) | l0
-    # byte1 = (h1 << 4) | l1
-    
-    q0 = (h0 << 4) | l0
-    q1 = (h1 << 4) | l1
-    
-    # Interleave
-    # We create an array of size 2 * n_packed
-    q_rec = np.empty(n_packed * 2, dtype=np.uint8)
-    q_rec[0::2] = q0
-    q_rec[1::2] = q1
-    
-    # Trim padding if necessary
-    q_rec = q_rec[:n_elems]
-    
-    quantized = torch.from_numpy(q_rec.view(np.int8).copy()).float()
-
-    # Pad quantized to multiple of block_size for reshaping
-    padded_len = num_blocks * block_size
-    if padded_len > n_elems:
-        quantized = torch.nn.functional.pad(quantized, (0, padded_len - n_elems), value=0.0)
-
-    # Reshape and dequantize
-    Q = 127.0
-    quantized_blocks = quantized.view(num_blocks, block_size)
-    x_rec_blocks = (quantized_blocks / Q) * scales.unsqueeze(1)
-
-    # Flatten and trim
-    x_rec = x_rec_blocks.view(-1)[:n_elems]
-
-    # Convert to bf16
-    x_bf16 = x_rec.to(torch.bfloat16)
-    return x_bf16.view(torch.int16).numpy().tobytes()
-
-
-def _decode_bfp12(payload: bytes) -> bytes:
-    """Decode BF12 format (transposed int8 + delta-bf16 scales)."""
-    min_header = 4 + 4 + 2
-    if len(payload) < min_header:
-        raise ValueError("Payload too small to be valid BF12.")
-
-    offset = 4
-    n_elems = struct.unpack_from("<I", payload, offset)[0]
-    offset += 4
-    block_size = struct.unpack_from("<H", payload, offset)[0]
-    offset += 2
-
-    if n_elems == 0:
-        return b""
-
-    num_blocks = (n_elems + block_size - 1) // block_size
-
-    # Read scales (bf16 delta, byte-plane reordered)
-    scales_bytes_len = num_blocks * 2
-    scales_end = offset + scales_bytes_len
-    if scales_end > len(payload):
-        raise ValueError("Payload ended early while reading scales.")
-    
-    # Reverse byte-plane
-    scales_reordered = np.frombuffer(payload[offset:scales_end], dtype=np.uint8)
-    scales_arr = np.zeros((num_blocks, 2), dtype=np.uint8)
-    for i in range(2):
-        scales_arr[:, i] = scales_reordered[i*num_blocks:(i+1)*num_blocks]
-    
-    # Reconstruct from Deltas
-    scales_delta = np.frombuffer(scales_arr.tobytes(), dtype=np.int16)
-    # cumsum to restore values. 
-    scales_int16 = np.cumsum(scales_delta, dtype=np.int16)
-    
-    scales_bf16 = torch.from_numpy(scales_int16.copy()).view(torch.bfloat16)
-    scales = scales_bf16.float()
-    offset = scales_end
-
-    # Read transposed quantized data (PADDED)
-    padded_len = num_blocks * block_size
-    quantized_end = offset + padded_len
-    
-    if quantized_end > len(payload):
-         # Try reading non-padded length if padded read fails (legacy support?)
-         # But BF12 was just introduced and failed, so it doesn't really matter.
-         # Stick to strict reading.
-         raise ValueError("Payload ended early while reading quantized data.")
-
-    quantized_transposed = np.frombuffer(payload[offset:quantized_end], dtype=np.int8)
-    quantized_transposed_t = torch.from_numpy(quantized_transposed.copy()).float()
-    
-    # Restore shape: (block_size, num_blocks) -> (num_blocks, block_size)
-    quantized = quantized_transposed_t.view(block_size, num_blocks).t().contiguous()
-    
-    # Reshape and dequantize
-    Q = 127.0
-    x_rec_blocks = (quantized / Q) * scales.unsqueeze(1)
-
-    # Flatten and trim
-    x_rec = x_rec_blocks.view(-1)[:n_elems]
-
-    # Convert to bf16
-    x_bf16 = x_rec.to(torch.bfloat16)
-    return x_bf16.view(torch.int16).numpy().tobytes()
-
-
-def _decode_bfp11(payload: bytes) -> bytes:
-    """Decode BF11 format (byte-split bf16 scales + int8 quantized)."""
-    min_header = 4 + 4 + 2  # MAGIC + n_elems + block_size
-    if len(payload) < min_header:
-        raise ValueError("Payload too small to be valid BF11.")
-
-    offset = 4  # skip MAGIC
-    n_elems = struct.unpack_from("<I", payload, offset)[0]
-    offset += 4
-    block_size = struct.unpack_from("<H", payload, offset)[0]
-    offset += 2
-
-    if n_elems == 0:
-        return b""
-
-    num_blocks = (n_elems + block_size - 1) // block_size
-
-    # Read scales (bf16, byte-plane reordered)
-    scales_bytes_len = num_blocks * 2
-    scales_end = offset + scales_bytes_len
-    if scales_end > len(payload):
-        raise ValueError("Payload ended early while reading scales.")
-    
-    # Reverse byte-plane reordering
-    scales_reordered = np.frombuffer(payload[offset:scales_end], dtype=np.uint8)
-    scales_arr = np.zeros((num_blocks, 2), dtype=np.uint8)
-    for i in range(2):
-        scales_arr[:, i] = scales_reordered[i*num_blocks:(i+1)*num_blocks]
-    
-    # Bytes -> int16 view -> bfloat16 -> float32
-    scales_int16 = np.frombuffer(scales_arr.tobytes(), dtype=np.int16)
-    # Important: Create a copy to ensure memory alignment for torch
-    scales_bf16 = torch.from_numpy(scales_int16.copy()).view(torch.bfloat16)
-    scales = scales_bf16.float()
-    offset = scales_end
-
-    # Read quantized values (int8, not transposed)
-    quantized_end = offset + n_elems
-    if quantized_end > len(payload):
-        raise ValueError("Payload ended early while reading quantized data.")
-    
-    quantized = np.frombuffer(payload[offset:quantized_end], dtype=np.int8)
-    quantized = torch.from_numpy(quantized.copy()).float()
-
-    # Pad quantized to multiple of block_size for reshaping
-    padded_len = num_blocks * block_size
-    if padded_len > n_elems:
-        quantized = torch.nn.functional.pad(quantized, (0, padded_len - n_elems), value=0.0)
-
-    # Reshape and dequantize
-    Q = 127.0
-    quantized_blocks = quantized.view(num_blocks, block_size)
-    x_rec_blocks = (quantized_blocks / Q) * scales.unsqueeze(1)
-
-    # Flatten and trim
-    x_rec = x_rec_blocks.view(-1)[:n_elems]
-
-    # Convert to bf16
-    x_bf16 = x_rec.to(torch.bfloat16)
-    return x_bf16.view(torch.int16).numpy().tobytes()
-
-
-def _decode_bfp10(payload: bytes) -> bytes:
-    """Decode BF10 format (byte-split fp16 scales + int8 quantized)."""
-    min_header = 4 + 4 + 2  # MAGIC + n_elems + block_size
-    if len(payload) < min_header:
-        raise ValueError("Payload too small to be valid BF10.")
-
-    offset = 4  # skip MAGIC
-    n_elems = struct.unpack_from("<I", payload, offset)[0]
-    offset += 4
-    block_size = struct.unpack_from("<H", payload, offset)[0]
-    offset += 2
-
-    if n_elems == 0:
-        return b""
-
-    num_blocks = (n_elems + block_size - 1) // block_size
-
-    # Read scales (fp16, byte-plane reordered)
-    scales_bytes_len = num_blocks * 2
-    scales_end = offset + scales_bytes_len
-    if scales_end > len(payload):
-        raise ValueError("Payload ended early while reading scales.")
-    
-    # Reverse byte-plane reordering
-    scales_reordered = np.frombuffer(payload[offset:scales_end], dtype=np.uint8)
-    scales_arr = np.zeros((num_blocks, 2), dtype=np.uint8)
-    for i in range(2):
-        scales_arr[:, i] = scales_reordered[i*num_blocks:(i+1)*num_blocks]
-    scales = np.frombuffer(scales_arr.tobytes(), dtype=np.float16)
-    scales = torch.from_numpy(scales.copy().astype(np.float32)).float()
-    offset = scales_end
-
-    # Read quantized values (int8, not transposed)
-    quantized_end = offset + n_elems
-    if quantized_end > len(payload):
-        raise ValueError("Payload ended early while reading quantized data.")
-    
-    quantized = np.frombuffer(payload[offset:quantized_end], dtype=np.int8)
-    quantized = torch.from_numpy(quantized.copy()).float()
-
-    # Pad quantized to multiple of block_size for reshaping
-    padded_len = num_blocks * block_size
-    if padded_len > n_elems:
-        quantized = torch.nn.functional.pad(quantized, (0, padded_len - n_elems), value=0.0)
-
-    # Reshape and dequantize
-    Q = 127.0
-    quantized_blocks = quantized.view(num_blocks, block_size)
-    x_rec_blocks = (quantized_blocks / Q) * scales.unsqueeze(1)
-
-    # Flatten and trim
-    x_rec = x_rec_blocks.view(-1)[:n_elems]
-
-    # Convert to bf16
-    x_bf16 = x_rec.to(torch.bfloat16)
-    return x_bf16.view(torch.int16).numpy().tobytes()
-
-
-def _decode_bfp9(payload: bytes) -> bytes:
-    """Decode BFP9 format (byte-split scales + int8 quantized)."""
-    min_header = 4 + 4 + 2 + 4  # MAGIC + n_elems + block_size + num_blocks
-    if len(payload) < min_header:
-        raise ValueError("Payload too small to be valid BFP9.")
-
-    offset = 4  # skip MAGIC
-    n_elems = struct.unpack_from("<I", payload, offset)[0]
-    offset += 4
-    block_size = struct.unpack_from("<H", payload, offset)[0]
-    offset += 2
-    num_blocks = struct.unpack_from("<I", payload, offset)[0]
-    offset += 4
-
-    if n_elems == 0:
-        return b""
-
-    # Read scales (fp32, byte-plane reordered)
-    scales_bytes_len = num_blocks * 4
-    scales_end = offset + scales_bytes_len
-    if scales_end > len(payload):
-        raise ValueError("Payload ended early while reading scales.")
-    
-    # Reverse byte-plane reordering
-    scales_reordered = np.frombuffer(payload[offset:scales_end], dtype=np.uint8)
-    scales_arr = np.zeros((num_blocks, 4), dtype=np.uint8)
-    for i in range(4):
-        scales_arr[:, i] = scales_reordered[i*num_blocks:(i+1)*num_blocks]
-    scales = np.frombuffer(scales_arr.tobytes(), dtype=np.float32)
-    scales = torch.from_numpy(scales.copy()).float()
-    offset = scales_end
-
-    # Read quantized values (int8, not transposed)
-    quantized_end = offset + n_elems
-    if quantized_end > len(payload):
-        raise ValueError("Payload ended early while reading quantized data.")
-    
-    quantized = np.frombuffer(payload[offset:quantized_end], dtype=np.int8)
-    quantized = torch.from_numpy(quantized.copy()).float()
-
-    # Pad quantized to multiple of block_size for reshaping
-    padded_len = num_blocks * block_size
-    if padded_len > n_elems:
-        quantized = torch.nn.functional.pad(quantized, (0, padded_len - n_elems), value=0.0)
-
-    # Reshape and dequantize
-    Q = 127.0
-    quantized_blocks = quantized.view(num_blocks, block_size)
-    x_rec_blocks = (quantized_blocks / Q) * scales.unsqueeze(1)
-
-    # Flatten and trim
-    x_rec = x_rec_blocks.view(-1)[:n_elems]
-
-    # Convert to bf16
-    x_bf16 = x_rec.to(torch.bfloat16)
-    return x_bf16.view(torch.int16).numpy().tobytes()
-
-
-def _decode_bfp6(payload: bytes) -> bytes:
-    """Decode BFP6 format (int8 quantized + fp16 scales, vectorized)."""
-    min_header = 4 + 4 + 2 + 4  # MAGIC + n_elems + block_size + num_blocks
-    if len(payload) < min_header:
-        raise ValueError("Payload too small to be valid BFP6.")
-
-    offset = 4  # skip MAGIC
-    n_elems = struct.unpack_from("<I", payload, offset)[0]
-    offset += 4
-    block_size = struct.unpack_from("<H", payload, offset)[0]
-    offset += 2
-    num_blocks = struct.unpack_from("<I", payload, offset)[0]
-    offset += 4
-
-    if n_elems == 0:
-        return b""
-
-    # Read scales (fp16 - 2 bytes each)
-    scales_bytes_len = num_blocks * 2
-    scales_end = offset + scales_bytes_len
-    if scales_end > len(payload):
-        raise ValueError("Payload ended early while reading scales.")
-    
-    scales = np.frombuffer(payload[offset:scales_end], dtype=np.float16)
-    scales = torch.from_numpy(scales.copy().astype(np.float32)).float()
-    offset = scales_end
-
-    # Read quantized values (int8)
-    quantized_end = offset + n_elems
-    if quantized_end > len(payload):
-        raise ValueError("Payload ended early while reading quantized data.")
-    
-    quantized = np.frombuffer(payload[offset:quantized_end], dtype=np.int8)
-    quantized = torch.from_numpy(quantized.copy()).float()
-
-    # Pad quantized to multiple of block_size for reshaping
-    padded_len = num_blocks * block_size
-    if padded_len > n_elems:
-        quantized = torch.nn.functional.pad(quantized, (0, padded_len - n_elems), value=0.0)
-
-    # Reshape and dequantize
-    Q = 127.0
-    quantized_blocks = quantized.view(num_blocks, block_size)
-    x_rec_blocks = (quantized_blocks / Q) * scales.unsqueeze(1)
-
-    # Flatten and trim
-    x_rec = x_rec_blocks.view(-1)[:n_elems]
-
-    # Convert to bf16
-    x_bf16 = x_rec.to(torch.bfloat16)
-    return x_bf16.view(torch.int16).numpy().tobytes()
-
-
-def _decode_bfp2(payload: bytes) -> bytes:
-    """Decode BFP2 format (int8 quantized, vectorized)."""
-    min_header = 4 + 4 + 2 + 4  # MAGIC + n_elems + block_size + num_blocks
-    if len(payload) < min_header:
-        raise ValueError("Payload too small to be valid BFP2.")
-
-    offset = 4  # skip MAGIC
-    n_elems = struct.unpack_from("<I", payload, offset)[0]
-    offset += 4
-    block_size = struct.unpack_from("<H", payload, offset)[0]
-    offset += 2
-    num_blocks = struct.unpack_from("<I", payload, offset)[0]
-    offset += 4
-
-    if n_elems == 0:
-        return b""
-
-    # Read scales (fp32)
-    scales_bytes_len = num_blocks * 4
-    scales_end = offset + scales_bytes_len
-    if scales_end > len(payload):
-        raise ValueError("Payload ended early while reading scales.")
-    
-    scales = np.frombuffer(payload[offset:scales_end], dtype=np.float32)
-    scales = torch.from_numpy(scales.copy()).float()
-    offset = scales_end
-
-    # Read quantized values (int8)
-    quantized_end = offset + n_elems
-    if quantized_end > len(payload):
-        raise ValueError("Payload ended early while reading quantized data.")
-    
-    quantized = np.frombuffer(payload[offset:quantized_end], dtype=np.int8)
-    quantized = torch.from_numpy(quantized.copy()).float()
-
-    # Pad quantized to multiple of block_size for reshaping
-    padded_len = num_blocks * block_size
-    if padded_len > n_elems:
-        quantized = torch.nn.functional.pad(quantized, (0, padded_len - n_elems), value=0.0)
-
-    # Reshape and dequantize
-    Q = 127.0
-    quantized_blocks = quantized.view(num_blocks, block_size)
-    x_rec_blocks = (quantized_blocks / Q) * scales.unsqueeze(1)
-
-    # Flatten and trim
-    x_rec = x_rec_blocks.view(-1)[:n_elems]
-
-    # Convert to bf16
-    x_bf16 = x_rec.to(torch.bfloat16)
-    return x_bf16.view(torch.int16).numpy().tobytes()
-
-
-def _decode_bfp1(payload: bytes) -> bytes:
-    """Decode legacy BFP1 format for backward compatibility."""
-    min_header = 4 + 4 + 2 + 1 + 1 + 4
-    if len(payload) < min_header:
-        raise ValueError("Payload too small to be valid BFP1.")
-
-    offset = 4  # skip MAGIC
-    n_elems = struct.unpack_from("<I", payload, offset)[0]
-    offset += 4
-    block_size = struct.unpack_from("<H", payload, offset)[0]
-    offset += 2
-    bits = struct.unpack_from("<B", payload, offset)[0]
-    offset += 1
-    scale_dtype = struct.unpack_from("<B", payload, offset)[0]
-    offset += 1
-    packed_q_len = struct.unpack_from("<I", payload, offset)[0]
-    offset += 4
-
-    if n_elems == 0:
-        return b""
-
-    num_blocks = (n_elems + block_size - 1) // block_size
-
-    # Read scales
-    scale_bytes_per_block = 4 if scale_dtype == 1 else 2
-    scale_np_dtype = np.float32 if scale_dtype == 1 else np.float16
-    
-    scales_bytes_len = num_blocks * scale_bytes_per_block
-    scales_end = offset + scales_bytes_len
-    scales = np.frombuffer(payload[offset:scales_end], dtype=scale_np_dtype).astype(np.float32)
-    scales = torch.from_numpy(scales.copy())
-    offset = scales_end
-
-    # Read and unpack quantized data
-    packed_end = offset + packed_q_len
-    packed_q = payload[offset:packed_end]
-    
-    # Fast unpack for 8-bit case
-    if bits == 8:
-        quantized = np.frombuffer(packed_q, dtype=np.int8)
-        quantized = torch.from_numpy(quantized.copy()).float()
-    else:
-        # Slow path for other bit widths
-        quantized = torch.tensor(_unpack_signed_ints_fast(packed_q, n_elems, bits), dtype=torch.float32)
-
-    Q = (1 << (bits - 1)) - 1
-
-    # Dequantize block by block
-    x_rec = torch.empty((n_elems,), dtype=torch.float32)
-    idx = 0
-    for bi in range(num_blocks):
-        start = bi * block_size
-        end = min(start + block_size, n_elems)
-        s = float(scales[bi].item())
-        block_len = end - start
-
-        if s == 0.0:
-            x_rec[start:end] = 0.0
-        else:
-            x_rec[start:end] = s * (quantized[idx:idx + block_len] / Q)
-
-        idx += block_len
-
-    x_bf16 = x_rec.to(torch.bfloat16)
-    return x_bf16.view(torch.int16).numpy().tobytes()
-
-
-def _unpack_signed_ints_fast(packed: bytes, count: int, bits: int):
-    """Unpack signed integers - vectorized where possible."""
-    if bits == 8:
-        return list(np.frombuffer(packed, dtype=np.int8)[:count])
-    
-    # For non-8-bit, use numpy-based approach
-    mask = (1 << bits) - 1
-    sign_bit = 1 << (bits - 1)
-    
-    packed_arr = np.frombuffer(packed, dtype=np.uint8)
-    values = []
-    acc = 0
-    acc_bits = 0
-    idx = 0
-
-    for _ in range(count):
-        while acc_bits < bits:
-            if idx >= len(packed_arr):
-                break
-            acc |= int(packed_arr[idx]) << acc_bits
-            acc_bits += 8
-            idx += 1
-
-        raw = acc & mask
-        acc >>= bits
-        acc_bits -= bits
-
-        if raw & sign_bit:
-            raw -= (1 << bits)
-        values.append(raw)
-
-    return values
-
-
-# =========================
-# API compression methods
-# =========================
-def _calculate_combined_score(original_bytes: bytes, payload: bytes) -> float:
-    """
-    Calculate the combined similarity score:
-    Score = (Percent Similarity in Norm) * (Cosine Similarity)
-    """
+try:
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+except Exception:
+    pass
+
+# ── 配置参数 ──────────────────────────────────────────────────────────────────
+LARGE_THRESHOLD = 2_000_000   # 大/小文件分界线 (字节)
+BROTLI_Q_SMALL  = 9           # 小文件 Brotli 质量
+BROTLI_Q_LARGE  = 2           # 大文件 Brotli 质量
+BROTLI_MODE     = 2           # Brotli 模式 (2=binary/font)
+SIM_THRESHOLD   = 0.99        # 相似度阈值
+
+CANDIDATES = [
+            (0, 8192 * 64),
+            (0, 8192 * 32),
+            (0, 8192 * 16),
+            (0, 8192),
+            (0.0005, 8192),
+            (0.001, 8192),
+            (0.001, 600),
+            (0.005, 600),
+            (0.005, 512),
+            (0.005, 1024),
+            (0.005, 2048),
+            (0.0003, 2048)
+        ]
+
+_MAX_OUTLIER_RATIO = max(r for r, _ in CANDIDATES)
+
+
+
+def compress_chunk(tensor_chunk: torch.Tensor, brotli_quality: int = BROTLI_Q_SMALL) -> bytes:
+    """压缩单个数据块 (性能优化版)."""
     try:
-        decoded_bytes = bfp_decode_to_bf16_bytes(payload)
-        
-        # Load tensors
-        original = torch.frombuffer(bytearray(original_bytes), dtype=torch.bfloat16).float()
-        decoded = torch.frombuffer(bytearray(decoded_bytes), dtype=torch.bfloat16).float()
-        
-        # Handle length mismatch (truncation/padding)
-        if len(decoded) != len(original):
-            min_len = min(len(original), len(decoded))
-            original = original[:min_len]
-            decoded = decoded[:min_len]
-            
-        norm_a = torch.linalg.norm(original)
-        norm_b = torch.linalg.norm(decoded)
-        
-        # 1. Percent Similarity in Norm
-        # Avoid division by zero
-        if norm_a == 0 and norm_b == 0:
-            norm_sim = 1.0
-        elif norm_a == 0 or norm_b == 0:
-            norm_sim = 0.0
+        n = tensor_chunk.numel()
+        chunk_f32 = tensor_chunk.float()
+
+        # ── 一次性 topk (abs + topk 只做一次) ─────────────────────────
+        k_max = int(n * _MAX_OUTLIER_RATIO)
+        if k_max > 0:
+            topk_vals, topk_idx_raw = torch.topk(chunk_f32.abs(), k_max)
         else:
-            # min / max approach
-            norm_sim = (torch.min(norm_a, norm_b) / torch.max(norm_a, norm_b)).item()
-            
-        # 2. Cosine Similarity
-        if norm_a == 0 or norm_b == 0:
-             # handled above effectively, but for completeness
-             if norm_a == norm_b: cosine_sim = 1.0
-             else: cosine_sim = 0.0
-        else:
-            cosine_sim = (torch.dot(original, decoded) / (norm_a * norm_b)).item()
-            
-        return norm_sim * cosine_sim
+            topk_idx_raw = None
 
-    except Exception:
-        # Fail safe
-        return 0.0
+        # 预计算 float64 原始向量 + norm (循环外只做一次)
+        a64 = chunk_f32.double()
+        norm_a = torch.linalg.norm(a64).item()
 
-def compress_data(data: bytes) -> bytes:
-    """
-    Lossy compression with aggressive adaptive block size.
-    Maximizes block size while maintaining Combined Score >= 0.99.
-    """
-    try:
-        if not data:
-            raise ValueError("Empty data received")
+        best_payload = None
+        best_size = float('inf')
 
-        # Candidate 44: AGGRESSIVE Single [216]
-        # Only use 216 block size - the proven winner starting point
-        # Ultra-minimum overhead, maximum compression
-        candidates = [239, 237, 227, 218, 188]
-        thresholds = [0.9999, 0.9999, 0.9999, 0.9999, 0.9999]
-        
-        selected_payload = None
-        
-        for bs in candidates:
-            # 1. Encode
-            payload = bfp_encode_bf16_bytes(data, block_size=bs)
-            # If we reached the last candidate and it still failed...
-            if bs == candidates[-1]:
-                # We have to return something.
-                selected_payload = payload
-                break
-            
-            # 2. Validate
-            score = _calculate_combined_score(data, payload)
-            
-            # Use a slightly stricter threshold locally to account for floating point jitter
-            # and ensure we pass the external 0.99 check comfortably.
-            if score >= thresholds[candidates.index(bs)]:
-                selected_payload = payload
-                break
-            
-            # If we reached the last candidate and it still failed...
-            if bs == candidates[-1]:
-                # We have to return something.
-                selected_payload = payload
+        for ci, (outlier_ratio, block_size) in enumerate(CANDIDATES):
+            k = int(n * outlier_ratio)
 
-        compressed = brotli.compress(selected_payload, quality=BROTLI_QUALITY)
-        return compressed
+            # ── 1. 离群值 (从预计算 topk 切片 + 排序) ────────────────
+            if k > 0 and topk_idx_raw is not None:
+                sub_idx, _ = torch.sort(topk_idx_raw[:k])
+                oi = sub_idx.to(torch.int32)
+                oi_long = oi.long()
+                ov_bf16 = chunk_f32[oi_long].to(torch.bfloat16)
+            else:
+                oi = oi_long = None
+                ov_bf16 = None
+                k = 0
+
+            # ── 2. 就地零化 (避免 clone) ─────────────────────────────
+            if k > 0:
+                saved = chunk_f32[oi_long].clone()
+                chunk_f32[oi_long] = 0.0
+
+            # ── 3. 分块量化 ──────────────────────────────────────────
+            padding = (block_size - (n % block_size)) % block_size
+            xp = F.pad(chunk_f32, (0, padding)) if padding > 0 else chunk_f32
+            nb = xp.numel() // block_size
+            blocks = xp.view(nb, block_size)
+
+            sc_bf16 = blocks.abs().max(dim=1).values.to(torch.bfloat16)
+            sc_f32 = sc_bf16.float()
+            sc_safe = sc_f32.clone()
+            sc_safe[sc_safe == 0] = 1.0
+
+            q = blocks / sc_safe.unsqueeze(1) * 127.0
+            q.round_().clamp_(-127, 127)
+            qi8 = q.to(torch.int8)
+
+            # ── 4. 恢复 outliers ─────────────────────────────────────
+            if k > 0:
+                chunk_f32[oi_long] = saved
+
+            # ── 5. 相似度检查 ────────────────────────────────────────
+            rec = (qi8.float() / 127.0 * sc_f32.unsqueeze(1)).view(-1)[:n]
+            if k > 0:
+                rec[oi_long] = ov_bf16.float()
+            b64 = rec.to(torch.bfloat16).double()
+            if norm_a == 0:
+                score = 1.0
+            else:
+                nb64 = torch.linalg.norm(b64).item()
+                if nb64 == 0:
+                    score = 0.0
+                else:
+                    cos = (torch.dot(a64, b64) / (norm_a * nb64)).item()
+                    rel = torch.linalg.norm(a64 - b64).item() / norm_a
+                    score = cos * (1.0 - rel)
+            if score < SIM_THRESHOLD:
+                continue
+
+            # ── 6. 达标! 序列化 + 压缩 + 立即返回 ───────────────────
+            if k > 0:
+                idx_np = oi.numpy()
+                delta = np.empty(k, dtype=np.int32)
+                delta[0] = idx_np[0]
+                delta[1:] = idx_np[1:] - idx_np[:-1]
+                idx_b = delta.tobytes()
+                val_b = ov_bf16.view(torch.int16).numpy().tobytes()
+            else:
+                idx_b = val_b = b""
+
+            sr = sc_bf16.view(torch.int16).numpy().view(np.uint8).reshape(-1, 2)
+            sc_b = np.concatenate([sr[:, 1], sr[:, 0]]).tobytes()
+
+            qn = qi8.view(-1)
+            if qn.numel() % 2 != 0:
+                qn = torch.cat([qn, torch.zeros(1, dtype=torch.int8)])
+            qu8 = qn.view(torch.uint8)
+            hi, lo = qu8 >> 4, qu8 & 0x0F
+            ph = ((hi[0::2] << 4) | hi[1::2]).numpy().tobytes()
+            pl = ((lo[0::2] << 4) | lo[1::2]).numpy().tobytes()
+
+            hdr = struct.pack('<iiiii', n, k, block_size, len(ph), len(pl))
+            payload = hdr + (idx_b + val_b if k > 0 else b"") + sc_b + ph + pl
+
+            return brotli.compress(payload, quality=brotli_quality, mode=BROTLI_MODE)
+
+        return b""
 
     except Exception as e:
+        raise ValueError(f"Chunk compression failed: {e}")
+
+def decompress_chunk(compressed_chunk: bytes) -> torch.Tensor:
+    """Decompress a single chunk using V37 algorithm (Hybrid: Outliers + Adaptive Blocks)."""
+    try:
+        if not compressed_chunk:
+            return torch.empty(0, dtype=torch.bfloat16)
+            
+        decompressed = brotli.decompress(compressed_chunk)
+        
+        # 1. Header (5 integers = 20 bytes)
+        # original_length, num_outliers, block_size, len(stream_high), len(stream_low)
+        original_length, num_outliers, block_size, stream_high_len, stream_low_len = struct.unpack('<iiiii', decompressed[:20])
+        offset = 20
+        
+        # 2. Outliers (Delta Encoding)
+        if num_outliers > 0:
+            indices_size = num_outliers * 4
+            outlier_indices_delta = np.frombuffer(decompressed[offset : offset + indices_size], dtype=np.int32)
+            outlier_indices = np.cumsum(outlier_indices_delta, dtype=np.int32)
+            offset += indices_size
+            
+            vals_size = num_outliers * 2
+            outlier_values = torch.frombuffer(bytearray(decompressed[offset : offset + vals_size]), dtype=torch.bfloat16)
+            offset += vals_size
+        else:
+            outlier_indices = np.array([], dtype=np.int32)
+            outlier_values = torch.empty(0, dtype=torch.bfloat16)
+
+        # 3. Scales (Split bfloat16)
+        # Calculate num_blocks based on dynamic block_size
+        padded_length = (original_length + block_size - 1) // block_size * block_size
+        num_blocks = padded_length // block_size
+        
+        if num_blocks > 0:
+            # Read High and Low streams for scales
+            s_high_bytes = decompressed[offset : offset + num_blocks]
+            offset += num_blocks
+            s_low_bytes = decompressed[offset : offset + num_blocks]
+            offset += num_blocks
+            
+            # Reconstruct
+            # Ensure bytes for frombuffer
+            if not isinstance(s_high_bytes, bytes): s_high_bytes = bytes(s_high_bytes)
+            if not isinstance(s_low_bytes, bytes): s_low_bytes = bytes(s_low_bytes)
+
+            try:
+                s_high = torch.frombuffer(s_high_bytes, dtype=torch.uint8)
+                s_low = torch.frombuffer(s_low_bytes, dtype=torch.uint8)
+                
+                s_rec = torch.empty(num_blocks * 2, dtype=torch.uint8)
+                s_rec[0::2] = s_low
+                s_rec[1::2] = s_high
+                
+                scales = s_rec.view(torch.bfloat16).float()
+            except Exception as e:
+                raise ValueError(f"Scales reconstruction failed: {e}")
+        else:
+            scales = torch.empty(0, dtype=torch.float32)
+        
+        # 4. Streams (High/Low Nibbles)
+        stream_high_bytes = decompressed[offset : offset + stream_high_len]
+        if stream_high_len > 0:
+            if len(stream_high_bytes) == 0:
+                 raise ValueError(f"High stream empty but len {stream_high_len}")
+            packed_high = torch.frombuffer(stream_high_bytes, dtype=torch.uint8) 
+        else:
+            packed_high = torch.empty(0, dtype=torch.uint8)
+        offset += stream_high_len
+        
+        stream_low_bytes = decompressed[offset : offset + stream_low_len]
+        if stream_low_len > 0:
+            packed_low = torch.frombuffer(stream_low_bytes, dtype=torch.uint8)
+        else:
+            packed_low = torch.empty(0, dtype=torch.uint8)
+            
+        # 5. Unpack Nibbles
+        total_elements = padded_length
+        # Unpack High Stream
+        # h_unpacked[0::2] = packed >> 4
+        # h_unpacked[1::2] = packed & 0x0F
+        
+        if stream_high_len > 0:
+            h_unpacked = torch.empty(stream_high_len * 2, dtype=torch.uint8)
+            h_unpacked[0::2] = (packed_high >> 4)
+            h_unpacked[1::2] = (packed_high & 0x0F)
+            high = h_unpacked[:total_elements]
+        else:
+            high = torch.zeros(total_elements, dtype=torch.uint8)
+            
+        if stream_low_len > 0:
+            l_unpacked = torch.empty(stream_low_len * 2, dtype=torch.uint8)
+            l_unpacked[0::2] = (packed_low >> 4)
+            l_unpacked[1::2] = (packed_low & 0x0F)
+            low = l_unpacked[:total_elements]
+        else:
+            low = torch.zeros(total_elements, dtype=torch.uint8)
+            
+        # Combine
+        q_uint8 = (high << 4) | low
+        q_8 = q_uint8.view(torch.int8)
+        
+        # Reshape to (num_blocks, block_size)
+        q_blocks = q_8.view(num_blocks, block_size)
+        
+        # 6. Dequantize
+        # x_rec = q * scale / 127
+        rec_float = (q_blocks.float() * scales.unsqueeze(1)) / 127.0
+        
+        # Flatten and crop
+        rec_flat = rec_float.view(-1)
+        tensor_rec = rec_flat[:original_length].to(torch.bfloat16)
+
+        # 7. Apply Outliers
+        if num_outliers > 0:
+            # We used Delta Encoding for indices
+            idx = outlier_indices.astype(np.int64)
+            tensor_rec.view(-1)[idx] = outlier_values.float().to(torch.bfloat16)
+            # wait, tensor_rec is bfloat16. outlier_values is bfloat16. good.
+            # But tensor_rec assignment: tensor_rec is 1D? Yes.
+            
+        return tensor_rec
+
+    except Exception as e:
+        # import gc; gc.collect()
+        raise ValueError(f"Chunk decompression failed: {str(e)}") from e
+def compress_data(data: bytes) -> bytes:
+    try:
+        if not data:
+            return b""
+            
+        # Global Chunking Strategy to prevent OOM
+        # 32MB chunks (16M bfloat16 elements)
+        ELEMENTS_PER_CHUNK = 16 * 1024 * 1024 
+        BYTES_PER_CHUNK = ELEMENTS_PER_CHUNK * 2
+        
+        # 根据文件大小选择 Brotli 质量
+        bq = BROTLI_Q_SMALL if len(data) <= LARGE_THRESHOLD else BROTLI_Q_LARGE
+        
+        full_tensor = torch.frombuffer(bytearray(data), dtype=torch.bfloat16)
+        total_elements = full_tensor.numel()
+        
+        compressed_parts = []
+        
+        for i in range(0, total_elements, ELEMENTS_PER_CHUNK):
+            chunk = full_tensor[i : i + ELEMENTS_PER_CHUNK]
+            compressed_chunk = compress_chunk(chunk, brotli_quality=bq)
+            
+            # Simple framing: Length (4 bytes) + Chunk Data
+            frame = struct.pack('<I', len(compressed_chunk)) + compressed_chunk
+            compressed_parts.append(frame)
+            
+            # Force GC (optional, let's trust Python for now to be faster)
+            del chunk
+            
+        # import gc; gc.collect()
+            
+        return b"".join(compressed_parts)
+
+    except Exception as e:
+        # import gc; gc.collect()
         raise ValueError(f"Compression failed: {str(e)}") from e
 
 
 def decompress_data(data: bytes) -> bytes:
-    """
-    Decompression:
-      brotli -> BFP payload -> bf16 bytes
-    """
     try:
         if not data:
-            raise ValueError("Empty data received")
-
-        payload = brotli.decompress(data)
-        out = bfp_decode_to_bf16_bytes(payload)
-
-        # Must be bf16-aligned
-        if len(out) % 2 != 0:
-            raise ValueError("Decoded output is not bf16-aligned (length not multiple of 2).")
-
-        return out
-
+            return b""
+            
+        offset = 0
+        total_len = len(data)
+        decompressed_parts = []
+        
+        while offset < total_len:
+            # Read Frame Length
+            if offset + 4 > total_len:
+                raise ValueError("Incomplete frame header")
+                
+            chunk_len = struct.unpack('<I', data[offset : offset + 4])[0]
+            offset += 4
+            
+            if offset + chunk_len > total_len:
+                raise ValueError("Incomplete frame body")
+                
+            chunk_data = data[offset : offset + chunk_len]
+            offset += chunk_len
+            
+            decompressed_chunk = decompress_chunk(chunk_data)
+            decompressed_parts.append(decompressed_chunk)
+            
+            # Streaming append would be better but list append + join is okay for byte strings
+            
+        if not decompressed_parts:
+            return b""
+            
+        full_tensor = torch.cat(decompressed_parts)
+        return full_tensor.view(torch.int16).numpy().tobytes()
+        
     except Exception as e:
+        import gc
+        gc.collect()
         raise ValueError(f"Decompression failed: {str(e)}") from e
 
 
-# =========================
-# FastAPI app
-# =========================
+def _validate(data: bytes) -> dict:
+    # Validate that data compresses and decompresses correctly
+    # Returns: (is_valid, compression_efficiency, cosine_similarity)
+    # Data represents torch bfloat16 values (2 bytes per element)
+    input_tensor = torch.frombuffer(bytearray(data), dtype=torch.bfloat16)
+    compressed = compress_data(data)
+    decompressed = decompress_data(compressed)
+    output_tensor = torch.frombuffer(bytearray(decompressed), dtype=torch.bfloat16)
+
+    is_valid = torch.equal(input_tensor, output_tensor)
+    compression_efficiency = 1 - (len(compressed) / len(data))
+
+    # APEX similarity formula (float64 precision to match server)
+    a = input_tensor.double()
+    b = output_tensor.double()
+
+    a_norm = torch.linalg.norm(a).item()
+    b_norm = torch.linalg.norm(b).item()
+
+    if a_norm == 0:
+        cosine_similarity = 1.0 if b_norm == 0 else 0.0
+        norm_similarity = 1.0 if b_norm == 0 else 0.0
+    else:
+        cosine_similarity = (torch.dot(a, b) / (a_norm * b_norm)).item() if b_norm != 0 else 0.0
+        norm_similarity = 1 - torch.linalg.norm(a - b).item() / a_norm
+    similarity = cosine_similarity * norm_similarity
+
+    return {
+        "is_valid": is_valid,
+        "compression_efficiency": compression_efficiency,
+        "cosine_similarity": float(cosine_similarity),
+        "norm_similarity": float(norm_similarity),
+        "similarity": float(similarity),
+    }
+
 def make_app() -> FastAPI:
-    app = FastAPI(title="Matrix Compression Miner API (BFP + zstd, vectorized)")
+    app = FastAPI(title="Matrix Compression Miner API")
 
     @app.get("/health")
     def health():
@@ -831,12 +399,14 @@ def make_app() -> FastAPI:
     async def compress(file: UploadFile = File(...)):
         try:
             data = await file.read()
-            if not data:
-                raise HTTPException(status_code=400, detail="No data received in file")
-
+            # Remove explicit 400 check for empty data to handle edge cases gracefully
+            # if not data:
+            #     raise HTTPException(status_code=400, detail="No data received in file")
+            
+            # Log data info for debugging (first 50 bytes)
+            print(f"DEBUG: Received {len(data)} bytes")
             compressed = compress_data(data)
             return Response(content=compressed, media_type="application/octet-stream")
-
         except HTTPException:
             raise
         except Exception as e:
@@ -848,12 +418,14 @@ def make_app() -> FastAPI:
     async def decompress(file: UploadFile = File(...)):
         try:
             data = await file.read()
-            if not data:
-                raise HTTPException(status_code=400, detail="No data received in file")
-
+            # Remove explicit 400 check
+            # if not data:
+            #     raise HTTPException(status_code=400, detail="No data received in file")
+            
+            # Log data info for debugging (first 50 bytes)
+            print(f"DEBUG: Received {len(data)} bytes")
             decompressed = decompress_data(data)
             return Response(content=decompressed, media_type="application/octet-stream")
-
         except HTTPException:
             raise
         except Exception as e:
@@ -869,5 +441,4 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--host", type=str, default="0.0.0.0")
     args = parser.parse_args()
-
     uvicorn.run(make_app(), host=args.host, port=args.port, log_level="info")
